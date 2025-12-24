@@ -1,17 +1,37 @@
 import os
+import time
+import uuid
 import requests
 import googlemaps
+import urllib.parse  
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 
 app = FastAPI()
+
 GMAPS_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-OLLAMA_URL = os.getenv("OLLAMA_HOST") + "/api/chat"
-gmaps = googlemaps.Client(key=GMAPS_KEY)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama-maps:11434")
+OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
+VIRTUAL_MODEL_ID = "maps-assistant"
+ACTUAL_OLLAMA_MODEL = "llama3.1:8b"
+
+try:
+    if GMAPS_KEY:
+        gmaps = googlemaps.Client(key=GMAPS_KEY)
+    else:
+        gmaps = None
+except Exception:
+    gmaps = None
+
+class Message(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
-    message: str
-    model: str = "llama3.1:8b" # Default model
+    model: str = VIRTUAL_MODEL_ID
+    messages: List[Message] 
+    stream: bool = False
 
 tools_schema = [
     {
@@ -24,7 +44,7 @@ tools_schema = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query, e.g. 'sate ayam near me' or 'cafe in Jakarta'",
+                        "description": "The search query, e.g. 'sate ayam near me'",
                     }
                 },
                 "required": ["query"],
@@ -33,17 +53,43 @@ tools_schema = [
     }
 ]
 
-@app.post("/v1/chat")
+@app.get("/")
+def root():
+    return {"status": "AI Maps Recommender Ready", "model_id": VIRTUAL_MODEL_ID}
+
+@app.get("/v1/models")
+def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": VIRTUAL_MODEL_ID,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "custom-maps-backend",
+            }
+        ]
+    }
+
+@app.post("/v1/chat/completions")
 async def chat_handler(req: ChatRequest):
+    last_user_message = req.messages[-1].content
+    
     payload = {
-        "model": req.model,
-        "messages": [{"role": "user", "content": req.message}],
+        "model": ACTUAL_OLLAMA_MODEL, 
+        "messages": [{"role": "user", "content": last_user_message}],
         "stream": False,
         "tools": tools_schema 
     }
 
+    final_content = ""
+
     try:
-        response = requests.post(OLLAMA_URL, json=payload)
+        response = requests.post(OLLAMA_CHAT_URL, json=payload)
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Ollama Error: {response.text}")
+
         response_data = response.json()
         ai_message = response_data.get("message", {})
 
@@ -52,42 +98,63 @@ async def chat_handler(req: ChatRequest):
             function_name = tool_call["function"]["name"]
             arguments = tool_call["function"]["arguments"]
             
-            if function_name == "search_places":
+            if function_name == "search_places" and gmaps:
                 query = arguments.get("query")
                 
-                print(f"🤖 AI Requesting Map Search for: {query}")
                 places_result = gmaps.places(query=query)
                 
                 if places_result['status'] == 'OK' and places_result['results']:
-                    top_places = places_result['results'][:3]
-                    results_text = "Here are the places I found on Google Maps:\n"
+                    top_places = places_result['results'][:5]
                     
-                    for place in top_places:
+                    results_text = f"### 🗺️ Search Results for: '{query}'\n\n"
+                    
+                    for i, place in enumerate(top_places, 1):
                         name = place.get('name')
                         address = place.get('formatted_address')
                         place_id = place.get('place_id')
-                        map_link = f"https://www.google.com/maps/search/?api=1&query={name}&query_place_id={place_id}"
+                        rating = place.get('rating', 'N/A')
+                        user_ratings_total = place.get('user_ratings_total', 0)
+
+                        safe_name = urllib.parse.quote(name)
+                        map_link = f"https://www.google.com/maps/search/?api=1&query={safe_name}&query_place_id={place_id}"
                         
-                        results_text += f"- **{name}** ({address})\n  [📍 View on Map]({map_link})\n"
+                        results_text += f"**{i}. {name}** (⭐ {rating} | {user_ratings_total} reviews)\n"
+                        results_text += f"   📍 _{address}_\n"
+                        results_text += f"   🔗 [Open in Google Maps]({map_link})\n\n"
+                        results_text += "---\n\n" 
                     
-                    return {
-                        "role": "assistant",
-                        "content": results_text,
-                        "action": "open_map"
-                    }
+                    final_content = results_text
                 else:
-                    return {"role": "assistant", "content": "Sorry, I couldn't find that location on Google Maps."}
+                    final_content = f"Sorry, I searched Google Maps for '{query}' but couldn't find any matching results."
+            elif not gmaps:
+                final_content = "Sorry, Google Maps API Key is missing or invalid."
+            else:
+                 final_content = "Sorry, map search is currently unavailable."
+        
+        else:
+            final_content = ai_message.get("content", "")
 
         return {
-            "role": "assistant",
-            "content": ai_message.get("content", "")
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_content
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0, 
+                "completion_tokens": 0, 
+                "total_tokens": 0
+            }
         }
 
     except Exception as e:
-        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# Health Check
-@app.get("/")
-def root():
-    return {"status": "running", "service": "AI Maps Recommender"}
