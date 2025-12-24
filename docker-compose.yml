@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  ollama-maps:
+    image: ollama/ollama:latest
+    container_name: maps-ollama
+    volumes:
+      - ../models:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - maps-net
+
+  backend-maps:
+    build: .
+    container_name: maps-api
+    ports:
+      - "8000:8000"
+    environment:
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - OLLAMA_HOST=http://ollama-maps:11434
+    depends_on:
+      - ollama-maps
+    networks:
+      - maps-net
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: maps-webui
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama-maps:11434
+    volumes:
+      - ./webui-data:/app/backend/data
+    depends_on:
+      - ollama-maps
+    networks:
+      - maps-net
+
+networks:
+  maps-net:
